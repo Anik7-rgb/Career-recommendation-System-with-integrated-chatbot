@@ -1,0 +1,358 @@
+from ml_predictor import predict_top_roles
+from job_scraper import get_jobs_for_role
+# from course_suggester import recommend_courses  # replaced by integrated logic below
+
+from flask import Flask, request, render_template, jsonify
+from resume_parser import extract_skills_from_text, extract_text_from_pdf
+from recommender import recommend_roles
+import os
+import json
+import requests
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# --------------------------
+# Config for local LLMs - UPDATED FOR DUAL MODELS
+# --------------------------
+LM_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
+
+# Model for chatbot (larger, better quality responses)
+CHATBOT_MODEL = os.getenv("CHATBOT_MODEL", "llama-3.1-8b-instruct")  # Large model for chat
+CHATBOT_TIMEOUT = float(os.getenv("CHATBOT_TIMEOUT", "30"))  # Longer timeout for large model
+
+# Model for course recommendations (smaller, faster)
+COURSE_MODEL = os.getenv("COURSE_MODEL", "phi-3-mini-4k-instruct")  # Smaller model for quick tasks
+COURSE_TIMEOUT = float(os.getenv("COURSE_TIMEOUT", "10"))  # Shorter timeout for quick tasks
+
+# Backward compatibility - keeping original variables for existing AI query functionality
+LM_MODEL = CHATBOT_MODEL  # Default to chatbot model for backward compatibility
+LM_TIMEOUT = CHATBOT_TIMEOUT
+
+# --------------------------
+# Simple in-memory course DB
+# --------------------------
+course_db = {
+    "python": ["Python for Everybody – Coursera", "Learn Python – Codecademy"],
+    "sql": ["Intro to SQL – Khan Academy", "SQL Basics – DataCamp"],
+    "machine learning": ["ML Crash Course – Google", "ML A-Z – Udemy"],
+    "html": ["HTML & CSS – FreeCodeCamp"],
+    "flask": ["Flask Mega-Tutorial – Miguel Grinberg"],
+    "javascript": ["JavaScript Basics – MDN", "JS Complete Course – Udemy"],
+    "react": ["React Tutorial – Official Docs", "React Masterclass – Scrimba"],
+    "node.js": ["Node.js Tutorial – W3Schools", "Node.js Complete Guide – Udemy"],
+    "data analysis": ["Data Analysis with Python – FreeCodeCamp", "Pandas Tutorial – Kaggle"],
+    "aws": ["AWS Cloud Practitioner – AWS", "AWS Solutions Architect – A Cloud Guru"]
+}
+
+# --------------------------
+# Baseline recommender (your original logic)
+# --------------------------
+def recommend_courses_baseline(skills):
+    recommended = []
+    for skill, courses in course_db.items():
+        if skill not in [s.lower() for s in skills]:
+            for course in courses:
+                recommended.append((skill.title(), course))
+    return recommended[:5]  # limit output
+
+# --------------------------
+# LLM helper utilities - UPDATED FOR MODEL SELECTION
+# --------------------------
+def _format_candidates(cands):
+    lines = []
+    for i, (skill, title) in enumerate(cands, 1):
+        lines.append(f"{i}. [{skill}] {title}")
+    return "\n".join(lines)
+
+def _llm_chat(messages, temperature=0.2, max_tokens=256, model_name=None, timeout=None):
+    """Updated to accept optional model name and timeout parameters"""
+    # Use specified model or fall back to course model for this function
+    model_to_use = model_name if model_name else COURSE_MODEL
+    timeout_to_use = timeout if timeout else COURSE_TIMEOUT
+    
+    url = f"{LM_BASE_URL}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "model": model_to_use,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False
+    }
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=timeout_to_use)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+def _parse_llm_selection(text, num_to_take=5):
+    text = text.strip()
+    # Try JSON array first
+    try:
+        arr = json.loads(text)
+        if isinstance(arr, list) and all(isinstance(x, int) for x in arr):
+            return arr[:num_to_take]
+    except Exception:
+        pass
+    # Fallback: parse numbered lines
+    indices = []
+    for line in text.splitlines():
+        line = line.strip()
+        num = ""
+        for ch in line:
+            if ch.isdigit():
+                num += ch
+            elif num:
+                break
+        if num:
+            try:
+                indices.append(int(num))
+            except Exception:
+                pass
+        if len(indices) >= num_to_take:
+            break
+    return indices[:num_to_take]
+
+# --------------------------
+# LLM-enhanced recommender - UPDATED TO USE COURSE MODEL
+# --------------------------
+def recommend_courses_llm(skills, top_k=5):
+    # Build candidate pool from uncovered skills
+    pool = []
+    known = {s.lower() for s in skills}
+    for skill, courses in course_db.items():
+        if skill not in known:
+            for c in courses:
+                pool.append((skill.title(), c))
+    if not pool:
+        return []
+
+    candidate_block = _format_candidates(pool)
+    system_msg = (
+        "You are a helpful course recommender. "
+        "Return ONLY a JSON array of integers (e.g., [3,1,7,5,2]) indicating the chosen item numbers in order."
+    )
+    user_msg = (
+        f"Learner's known skills: {', '.join(skills) if skills else 'None'}.\n\n"
+        f"Candidates:\n{candidate_block}\n\n"
+        f"Task: Choose the best {top_k} items optimizing for missing skills, progression, and quality. "
+        f"Return only a JSON array of item numbers."
+    )
+
+    try:
+        content = _llm_chat(
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=128,
+            model_name=COURSE_MODEL,  # Explicitly use smaller, faster model
+            timeout=COURSE_TIMEOUT
+        )
+        chosen = _parse_llm_selection(content, num_to_take=top_k)
+        ranked = []
+        for idx in chosen:
+            if 1 <= idx <= len(pool):
+                ranked.append(pool[idx - 1])
+        if ranked:
+            return ranked
+    except requests.exceptions.RequestException:
+        # LM Studio not reachable -> fallback
+        print("Course recommendation LLM not available, using fallback")
+        pass
+    except KeyError:
+        # Unexpected response -> fallback
+        print("Invalid response from course recommendation LLM, using fallback")
+        pass
+    except Exception as e:
+        # Any other error -> fallback
+        print(f"Error in course recommendation LLM: {e}, using fallback")
+        pass
+
+    # Fallback
+    return recommend_courses_baseline(skills)[:top_k]
+
+# --------------------------
+# Public API used by analyze()
+# --------------------------
+def recommend_courses(skills, use_llm=True, top_k=5):
+    if use_llm:
+        return recommend_courses_llm(skills, top_k=top_k)
+    return recommend_courses_baseline(skills)[:top_k]
+
+# ✅ AI query function for backward compatibility - UPDATED TO USE CHATBOT MODEL
+def ai_answer_query(query, extracted_skills):
+    prompt = f"""The user has these skills: {', '.join(extracted_skills)}.
+Their query is: "{query}".
+Give a short, helpful career suggestion."""
+
+    try:
+        response = requests.post(
+            f"{LM_BASE_URL}/chat/completions",
+            json={
+                "model": CHATBOT_MODEL,  # Uses larger chatbot model for better responses
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+                "max_tokens": 250
+            },
+            timeout=CHATBOT_TIMEOUT
+        )
+        result = response.json()
+        return result['choices'][0]['message']['content'].strip()
+    except requests.exceptions.RequestException as e:
+        return f"Error connecting to local model server: {e}"
+    except KeyError:
+        return "Error: Invalid response format from local model server"
+
+# --------------------------
+# NEW: Chatbot functionality - USES LARGE MODEL
+# --------------------------
+def get_lm_studio_response(user_message):
+    """
+    Send request to LM Studio local server for chatbot responses
+    Uses the larger model for better conversation quality
+    """
+    try:
+        # Enhanced career-focused system prompt for larger model
+        system_prompt = """You are an expert AI career assistant for SkillSense, a comprehensive career recommendation platform. 
+
+        Your expertise includes:
+        - **Career Guidance**: Personalized career path recommendations based on skills, interests, and market trends
+        - **Skill Development**: Identifying skill gaps and creating learning roadmaps
+        - **Job Market Intelligence**: Current industry trends, salary insights, and growth opportunities  
+        - **Interview Preparation**: Resume optimization, interview strategies, and common questions
+        - **Industry Knowledge**: Deep understanding of tech, business, healthcare, finance, and other sectors
+        - **Professional Growth**: Leadership development, networking strategies, and career transitions
+        - **Work-Life Balance**: Remote work advice, productivity tips, and career sustainability
+
+        Communication style:
+        - Be encouraging and supportive while providing practical, actionable advice
+        - Give specific examples and concrete steps when possible
+        - Keep responses informative but concise (2-4 paragraphs)
+        - Ask follow-up questions when appropriate to better understand user needs
+        - Stay current with industry trends and technologies"""
+        
+        payload = {
+            "model": CHATBOT_MODEL,  # Uses larger model for better responses
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 600,  # More tokens for detailed responses
+            "stream": False
+        }
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.post(
+            f"{LM_BASE_URL}/chat/completions", 
+            headers=headers, 
+            data=json.dumps(payload),
+            timeout=CHATBOT_TIMEOUT  # Longer timeout for large model
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result['choices'][0]['message']['content']
+        else:
+            return "I'm sorry, I'm having trouble processing your request right now. Please try again later."
+            
+    except requests.exceptions.ConnectionError:
+        return "I'm currently offline. Please make sure LM Studio is running with the chatbot model loaded and try again."
+    except requests.exceptions.Timeout:
+        return "The response is taking longer than expected. Please try asking a more specific question."
+    except Exception as e:
+        print(f"Chatbot LM Studio API error: {e}")
+        return "I encountered an error while processing your request. Please try again."
+
+# --------------------------
+# Routes
+# --------------------------
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    file = request.files['resume_file']
+    filename = file.filename
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+
+    # Get custom query from form (optional, for backward compatibility)
+    custom_query = request.form.get('custom_query', '').lower().strip()
+
+    # Extract text and skills from resume
+    resume_text = extract_text_from_pdf(filepath)
+    extracted_skills = extract_skills_from_text(resume_text)
+
+    # Decide job query (based on user input or predicted roles)
+    top_roles = predict_top_roles(extracted_skills)
+    if custom_query and any(word in custom_query for word in ["role", "job", "career", "position", "field", "recommend"]):
+        job_query = custom_query
+    else:
+        job_query = top_roles[0][0] if top_roles else "Software Developer"
+
+    # Get job listings via JSearch API
+    jobs = get_jobs_for_role(job_query)
+
+    # Recommend relevant courses (now LLM-enhanced with smaller model for speed)
+    courses = recommend_courses(extracted_skills, use_llm=True, top_k=5)
+
+    # Generate AI response if a query was entered (uses larger model for quality)
+    ai_response = ""
+    if custom_query:
+        ai_response = ai_answer_query(custom_query, extracted_skills)
+
+    return render_template(
+        'index.html',
+        filename=filename,
+        skills=extracted_skills,
+        top_roles=top_roles,
+        jobs=jobs,
+        courses=courses,  # list of tuples: (Skill, Course Title)
+        custom_query=custom_query,
+        job_query=job_query,
+        ai_response=ai_response
+    )
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """
+    NEW: Chatbot endpoint for real-time AI conversations
+    Uses large model for quality responses
+    """
+    try:
+        data = request.get_json()
+        user_message = data.get('message', '')
+        
+        if not user_message:
+            return jsonify({'error': 'No message provided'}), 400
+        
+        # Get response from LM Studio using large model
+        lm_studio_response = get_lm_studio_response(user_message)
+        
+        return jsonify({'response': lm_studio_response})
+        
+    except Exception as e:
+        print(f"Chat error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# --------------------------
+# Error handlers
+# --------------------------
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)

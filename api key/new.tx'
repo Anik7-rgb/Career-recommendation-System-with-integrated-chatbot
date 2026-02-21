@@ -1,0 +1,328 @@
+from ml_predictor import predict_top_roles
+from job_scraper import get_jobs_for_role
+# from course_suggester import recommend_courses  # replaced by integrated logic below
+
+from flask import Flask, request, render_template, jsonify
+from resume_parser import extract_skills_from_text, extract_text_from_pdf
+from recommender import recommend_roles
+import os
+import json
+import requests
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# --------------------------
+# Config for local LLM
+# --------------------------
+LM_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
+LM_MODEL = os.getenv("LM_STUDIO_MODEL", "mistral-7b-instruct.Q4_K_M.gguf")
+LM_TIMEOUT = float(os.getenv("LM_TIMEOUT", "15"))
+
+# --------------------------
+# Simple in-memory course DB
+# --------------------------
+course_db = {
+    "python": ["Python for Everybody – Coursera", "Learn Python – Codecademy"],
+    "sql": ["Intro to SQL – Khan Academy", "SQL Basics – DataCamp"],
+    "machine learning": ["ML Crash Course – Google", "ML A-Z – Udemy"],
+    "html": ["HTML & CSS – FreeCodeCamp"],
+    "flask": ["Flask Mega-Tutorial – Miguel Grinberg"]
+}
+
+# --------------------------
+# Baseline recommender (your original logic)
+# --------------------------
+def recommend_courses_baseline(skills):
+    recommended = []
+    for skill, courses in course_db.items():
+        if skill not in [s.lower() for s in skills]:
+            for course in courses:
+                recommended.append((skill.title(), course))
+    return recommended[:5]  # limit output
+
+# --------------------------
+# LLM helper utilities
+# --------------------------
+def _format_candidates(cands):
+    lines = []
+    for i, (skill, title) in enumerate(cands, 1):
+        lines.append(f"{i}. [{skill}] {title}")
+    return "\n".join(lines)
+
+def _llm_chat(messages, temperature=0.2, max_tokens=256):
+    url = f"{LM_BASE_URL}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "model": LM_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "stream": False
+    }
+    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=LM_TIMEOUT)
+    resp.raise_for_status()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
+
+def _parse_llm_selection(text, num_to_take=5):
+    text = text.strip()
+    # Try JSON array first
+    try:
+        arr = json.loads(text)
+        if isinstance(arr, list) and all(isinstance(x, int) for x in arr):
+            return arr[:num_to_take]
+    except Exception:
+        pass
+    # Fallback: parse numbered lines
+    indices = []
+    for line in text.splitlines():
+        line = line.strip()
+        num = ""
+        for ch in line:
+            if ch.isdigit():
+                num += ch
+            elif num:
+                break
+        if num:
+            try:
+                indices.append(int(num))
+            except Exception:
+                pass
+        if len(indices) >= num_to_take:
+            break
+    return indices[:num_to_take]
+
+# --------------------------
+# LLM-enhanced recommender
+# --------------------------
+def recommend_courses_llm(skills, top_k=5):
+    # Build candidate pool from uncovered skills
+    pool = []
+    known = {s.lower() for s in skills}
+    for skill, courses in course_db.items():
+        if skill not in known:
+            for c in courses:
+                pool.append((skill.title(), c))
+    if not pool:
+        return []
+
+    candidate_block = _format_candidates(pool)
+    system_msg = (
+        "You are a helpful course recommender. "
+        "Return ONLY a JSON array of integers (e.g., [3,1,7,5,2]) indicating the chosen item numbers in order."
+    )
+    user_msg = (
+        f"Learner's known skills: {', '.join(skills) if skills else 'None'}.\n\n"
+        f"Candidates:\n{candidate_block}\n\n"
+        f"Task: Choose the best {top_k} items optimizing for missing skills, progression, and quality. "
+        f"Return only a JSON array of item numbers."
+    )
+
+    try:
+        content = _llm_chat(
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.2,
+            max_tokens=128
+        )
+        chosen = _parse_llm_selection(content, num_to_take=top_k)
+        ranked = []
+        for idx in chosen:
+            if 1 <= idx <= len(pool):
+                ranked.append(pool[idx - 1])
+        if ranked:
+            return ranked
+    except requests.exceptions.RequestException:
+        # LM Studio not reachable -> fallback
+        pass
+    except KeyError:
+        # Unexpected response -> fallback
+        pass
+    except Exception:
+        # Any other error -> fallback
+        pass
+
+    # Fallback
+    return recommend_courses_baseline(skills)[:top_k]
+
+# --------------------------
+# Public API used by analyze()
+# --------------------------
+def recommend_courses(skills, use_llm=True, top_k=5):
+    if use_llm:
+        return recommend_courses_llm(skills, top_k=top_k)
+    return recommend_courses_baseline(skills)[:top_k]
+
+# ✅ Only 1 ai_answer_query function here (for backward compatibility)
+def ai_answer_query(query, extracted_skills):
+    prompt = f"""The user has these skills: {', '.join(extracted_skills)}.
+Their query is: "{query}".
+Give a short, helpful career suggestion."""
+
+    try:
+        response = requests.post(
+            f"{LM_BASE_URL}/chat/completions",
+            json={
+                "model": LM_MODEL,  # Matches the local model name
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.7,
+                "max_tokens": 250
+            },
+            timeout=LM_TIMEOUT
+        )
+        result = response.json()
+        return result['choices'][0]['message']['content'].strip()
+    except requests.exceptions.RequestException as e:
+        return f"Error connecting to local model server: {e}"
+    except KeyError:
+        return "Error: Invalid response format from local model server"
+
+# --------------------------
+# NEW: Chatbot functionality
+# --------------------------
+def get_lm_studio_response(user_message):
+    """
+    Send request to LM Studio local server for chatbot responses
+    """
+    try:
+        # Career-focused system prompt for chatbot
+        system_prompt = """You are an expert AI career assistant for SkillSense, a career recommendation platform. 
+        You help users with:
+        - Career guidance and path recommendations
+        - Skill development advice
+        - Job market insights and trends
+        - Resume and interview tips
+        - Industry knowledge and opportunities
+        - Learning path suggestions
+        - Salary and compensation guidance
+        - Work-life balance advice
+        
+        Provide helpful, actionable advice in a friendly and professional manner. 
+        Keep responses concise but informative (2-3 paragraphs maximum).
+        Always be encouraging and supportive while giving practical advice."""
+        
+        payload = {
+            "model": LM_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 500,
+            "stream": False
+        }
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        response = requests.post(
+            f"{LM_BASE_URL}/chat/completions", 
+            headers=headers, 
+            data=json.dumps(payload),
+            timeout=LM_TIMEOUT
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            return result['choices'][0]['message']['content']
+        else:
+            return "I'm sorry, I'm having trouble processing your request right now. Please try again later."
+            
+    except requests.exceptions.ConnectionError:
+        return "I'm currently offline. Please make sure LM Studio is running and try again."
+    except requests.exceptions.Timeout:
+        return "Request timed out. Please try asking a shorter question."
+    except Exception as e:
+        print(f"LM Studio API error: {e}")
+        return "I encountered an error while processing your request. Please try again."
+
+# --------------------------
+# Routes
+# --------------------------
+@app.route('/')
+def home():
+    return render_template('index.html')
+
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    file = request.files['resume_file']
+    filename = file.filename
+    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(filepath)
+
+    # Get custom query from form (optional, for backward compatibility)
+    custom_query = request.form.get('custom_query', '').lower().strip()
+
+    # Extract text and skills from resume
+    resume_text = extract_text_from_pdf(filepath)
+    extracted_skills = extract_skills_from_text(resume_text)
+
+    # Decide job query (based on user input or predicted roles)
+    top_roles = predict_top_roles(extracted_skills)
+    if custom_query and any(word in custom_query for word in ["role", "job", "career", "position", "field", "recommend"]):
+        job_query = custom_query
+    else:
+        job_query = top_roles[0][0] if top_roles else "Software Developer"
+
+    # Get job listings via JSearch API
+    jobs = get_jobs_for_role(job_query)
+
+    # Recommend relevant courses (now LLM-enhanced with fallback)
+    courses = recommend_courses(extracted_skills, use_llm=True, top_k=5)
+
+    # Generate AI response if a query was entered (backward compatibility)
+    ai_response = ""
+    if custom_query:
+        ai_response = ai_answer_query(custom_query, extracted_skills)
+
+    return render_template(
+        'index.html',
+        filename=filename,
+        skills=extracted_skills,
+        top_roles=top_roles,
+        jobs=jobs,
+        courses=courses,  # list of tuples: (Skill, Course Title)
+        custom_query=custom_query,
+        job_query=job_query,
+        ai_response=ai_response
+    )
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """
+    NEW: Chatbot endpoint for real-time AI conversations
+    """
+    try:
+        data = request.get_json()
+        user_message = data.get('message', '')
+        
+        if not user_message:
+            return jsonify({'error': 'No message provided'}), 400
+        
+        # Get response from LM Studio
+        lm_studio_response = get_lm_studio_response(user_message)
+        
+        return jsonify({'response': lm_studio_response})
+        
+    except Exception as e:
+        print(f"Chat error: {e}")
+        return jsonify({'error': 'Internal server error'}), 500
+
+# --------------------------
+# Error handlers
+# --------------------------
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({'error': 'Endpoint not found'}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    return jsonify({'error': 'Internal server error'}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
