@@ -4,7 +4,7 @@ def get_jobs_for_role(role, max_results=5):
     url = "https://jsearch.p.rapidapi.com/search"
     querystring = {"query": role, "num_pages": "1"}
     headers = {
-        "X-RapidAPI-Key": "d7c16a9efdmsh3f85b85a7b8ae51p14e8cfjsnfda220ee5c6f",  # Replace with your key
+        "X-RapidAPI-Key": "",  # Replace with your key
         "X-RapidAPI-Host": "jsearch.p.rapidapi.com"
 
     }
